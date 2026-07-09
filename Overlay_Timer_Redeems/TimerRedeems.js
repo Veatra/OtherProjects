@@ -18,6 +18,9 @@
  * 
  * Future Modification Advice:
  * - If adding new commands, update `parseTimeCommand()` and `handleMessage()`.
+ * - The timer intentionally has one canonical command parser. `commandPaused` is
+ *   pre-processed in `handleMessage()` into `commandMain` plus a `forceStartPaused`
+ *   routing flag so that timer creation logic never forks into duplicate code paths.
  * - If altering state, ensure `TimerState` typedef is updated to reflect new properties.
  * ============================================================================
  */
@@ -36,6 +39,7 @@
  * @property {number|null} [finishTimestamp] - The exact Epoch timestamp when the timer should hit 0
  * @property {string} [description] - Optional text displayed alongside the timer
  * @property {number} [initialDuration] - The total duration the timer was originally set for
+ * @property {boolean} [startedPausedByCommand] - True when a new timer was intentionally created paused through the paused trigger command
  */
 
 let fieldData;
@@ -68,6 +72,52 @@ function hexToRgba(hex, opacity) {
         b = parseInt(hex.substring(5, 7), 16);
     }
     return `rgba(${r}, ${g}, ${b}, ${opacity})`;
+}
+
+
+/**
+ * Sanitizes a single configured chat command into the bare trigger word used by
+ * StreamElements chat routing. Settings fields are intentionally user-friendly,
+ * so streamers may type either "time" or "!time"; internally we always store
+ * the command without leading exclamation marks to avoid accidental "!!time"
+ * matching bugs when command strings are assembled.
+ *
+ * @param {string|undefined|null} rawCommand - The command value from fieldData.
+ * @param {string} fallbackCommand - Safe command to use when settings are empty.
+ * @returns {string} Lowercase command word without leading exclamation marks.
+ */
+function sanitizeConfiguredCommand(rawCommand, fallbackCommand) {
+    const rawValue = typeof rawCommand === 'string' ? rawCommand : fallbackCommand;
+    const sanitizedCommand = rawValue.trim().toLowerCase().replace(/^!+/, '').trim();
+
+    if (!sanitizedCommand) {
+        console.warn(`[Timer Widget] COMMAND CONFIG: Empty command detected after sanitization. Falling back to "${fallbackCommand}".`);
+        return fallbackCommand;
+    }
+
+    return sanitizedCommand;
+}
+
+/**
+ * Normalizes all command-related settings once during widget initialization.
+ * Mutating fieldData here is intentional: every downstream router and parser can
+ * rely on clean, exclamation-free command words and avoid repeating defensive
+ * cleanup logic. Legacy `triggerCommands` is mapped to `commandMain` only as a
+ * backward-compatibility bridge for older installed widget configurations.
+ *
+ * @param {Object} loadedFieldData - StreamElements fieldData object.
+ * @returns {void}
+ */
+function normalizeCommandSettings(loadedFieldData) {
+    const legacyFirstTrigger = loadedFieldData.triggerCommands
+        ? loadedFieldData.triggerCommands.split(',')[0]
+        : 'time';
+
+    loadedFieldData.commandMain = sanitizeConfiguredCommand(loadedFieldData.commandMain || legacyFirstTrigger, 'time');
+    loadedFieldData.commandPaused = sanitizeConfiguredCommand(loadedFieldData.commandPaused, 'timer');
+    loadedFieldData.textOnlyCommand = sanitizeConfiguredCommand(loadedFieldData.textOnlyCommand, 'redeem');
+
+    console.log(`[Timer Widget] COMMAND CONFIG: Main trigger="!${loadedFieldData.commandMain}", paused trigger="!${loadedFieldData.commandPaused}", text-only keyword="${loadedFieldData.textOnlyCommand}".`);
 }
 
 // --- Core Timer State Management ---
@@ -265,21 +315,41 @@ function handleTextOnlyCommand(description) {
     $('#timer-display').addClass('hidden');
 }
 
-// Handles a new timer command (e.g., !time 5:00).
-function handleNewTimerCommand(duration, description) {
-    console.log(`[Timer Widget] NEW TIMER command executed. Duration: ${duration}s, Description: "${description}"`);
+/**
+ * Creates a new timer state from parsed command data. The same function handles
+ * both normal starts and paused starts so command parsing and state creation stay
+ * unified. `forceStartPaused` is only set by the paused trigger pre-processor in
+ * `handleMessage()`, preserving the main command's instant-start behavior.
+ *
+ * @param {number} duration - Timer duration in seconds.
+ * @param {string} description - Optional label displayed with the timer.
+ * @param {boolean} [forceStartPaused=false] - When true, create the timer paused instead of starting the countdown interval.
+ */
+function handleNewTimerCommand(duration, description, forceStartPaused = false) {
+    console.log(`[Timer Widget] NEW TIMER command executed. Duration: ${duration}s, Description: "${description}", Force paused: ${forceStartPaused}`);
+
     const newState = {
-        finishTimestamp: Date.now() + (duration * 1000),
-        isPaused: false,
-        remainingOnPause: 0,
+        finishTimestamp: forceStartPaused ? null : Date.now() + (duration * 1000),
+        isPaused: forceStartPaused,
+        remainingOnPause: forceStartPaused ? duration : 0,
         description: description,
         initialDuration: duration,
-        isTextOnly: false
+        isTextOnly: false,
+        startedPausedByCommand: forceStartPaused
     };
+
     $('#timer-display').removeClass('hidden');
     saveState(newState);
     showTimerUI(newState);
-    updateTimerDisplay(duration);
+    updateTimerDisplay(duration, forceStartPaused);
+
+    if (forceStartPaused) {
+        clearInterval(timerInterval);
+        timerInterval = null;
+        console.log(`[Timer Widget] NEW TIMER created paused by paused trigger. Awaiting "!${fieldData.commandMain} start" to begin countdown.`);
+        return;
+    }
+
     startCountdown();
 }
 
@@ -327,33 +397,46 @@ function handleTimeModificationCommand(operation, duration, newDescription) {
 }
 
 /**
- * Helper to get the list of valid trigger commands from user settings.
- * Splits by comma, trims spaces, and removes any accidental '!' the user might have typed.
- * 
- * @returns {string[]} Array of clean trigger words (e.g., ['time', 'timer']).
+ * Helper to get the canonical main trigger command from user settings.
+ * The parser intentionally recognizes only this command; the paused trigger is
+ * translated to this command before parsing so every timer action flows through
+ * one regex and one set of downstream handlers.
+ *
+ * @returns {string} Clean main trigger word (e.g., 'time').
  */
-function getValidTriggers() {
-    const rawTriggers = (fieldData && fieldData.triggerCommands) ? fieldData.triggerCommands : "time, timer";
-    return rawTriggers.split(',').map(cmd => cmd.trim().toLowerCase().replace(/^!/, ''));
+function getMainTriggerCommand() {
+    if (!fieldData) return 'time';
+    return sanitizeConfiguredCommand(fieldData.commandMain, 'time');
+}
+
+/**
+ * Helper to get the paused trigger command from user settings.
+ * This command is detected only in `handleMessage()` and converted into the main
+ * command plus `forceStartPaused = true` for new timer creation.
+ *
+ * @returns {string} Clean paused trigger word (e.g., 'timer').
+ */
+function getPausedTriggerCommand() {
+    if (!fieldData) return 'timer';
+    return sanitizeConfiguredCommand(fieldData.commandPaused, 'timer');
 }
 
 /**
  * Parses regex commands to extract operation type, duration in seconds, and description.
- * Dynamically builds the regex based on user-defined trigger words.
- * Supports syntax formats: !time +5m, !timer add 5:00 !countdown 1:30:00, etc.
+ * Dynamically builds the regex based on the single canonical main trigger word.
+ * Supports syntax formats after paused-trigger normalization: !time +5, !time 5:00, !time 1:30:00, etc.
  * 
  * @param {string} command - The raw chat string.
  * @returns {Object|null} - Parsed command details or null if invalid.
  */
 function parseTimeCommand(command) {
-    const triggers = getValidTriggers();
+    const mainTrigger = getMainTriggerCommand();
     
-    // Escape standard regex characters in case a user uses special symbols in their commands
-    const escapedTriggers = triggers.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-    const triggerPattern = escapedTriggers.join('|');
+    // Escape standard regex characters in case a user uses special symbols in their command.
+    const escapedMainTrigger = mainTrigger.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-    // Dynamically build: /^!(time|timer|cd)\s+([+-]?)(\d+(?::\d+){1,2}|\d*\.?\d+)\s*(.*)$/i
-    const regex = new RegExp(`^!(${triggerPattern})\\s+([+-]?)(\\d+(?::\\d+){1,2}|\\d*\\.?\\d+)\\s*(.*)$`, 'i');
+    // Dynamically build: /^!(time)\s+([+-]?)(\d+(?::\d+){1,2}|\d*\.?\d+)\s*(.*)$/i
+    const regex = new RegExp(`^!(${escapedMainTrigger})\\s+([+-]?)(\\d+(?::\\d+){1,2}|\\d*\\.?\\d+)\\s*(.*)$`, 'i');
     const match = command.match(regex);
 
     if (match) {
@@ -486,27 +569,37 @@ const handleMessage = (obj) => {
     const data = obj.detail.event.data;
     const text = data.text.trim();
     
-    // Get the dynamic list of triggers and the first word of the chat message
-    const triggers = getValidTriggers();
+    // Capture the first chat word once, then classify it against the two configured entry points.
+    // The paused command is deliberately not parsed directly. Instead, it is normalized into
+    // the main command below so `parseTimeCommand()` and all router behavior stay unified.
+    const mainCommand = getMainTriggerCommand();
+    const pausedCommand = getPausedTriggerCommand();
     const firstWord = text.split(' ')[0].toLowerCase();
-    
-    // Ensure the message starts exactly with '!' followed by one of our configured triggers
-    const isTriggerCommand = triggers.some(trigger => firstWord === `!${trigger}`);
-    if (!isTriggerCommand) {
-        return; // Ignore regular chat messages
+    const isMainTriggerCommand = firstWord === `!${mainCommand}`;
+    // If both settings are accidentally identical, prefer the main command behavior.
+    // This avoids surprising streamers by making their normal command create paused timers.
+    const isPausedTriggerCommand = !isMainTriggerCommand && firstWord === `!${pausedCommand}`;
+
+    if (!isMainTriggerCommand && !isPausedTriggerCommand) {
+        return; // Ignore regular chat messages and unrelated commands.
     }
 
-    console.log(`[Timer Widget] Trigger detected: "${text}". Running permission checks...`);
+    const forceStartPaused = isPausedTriggerCommand;
+    const normalizedText = forceStartPaused
+        ? text.replace(new RegExp(`^!${pausedCommand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`, 'i'), `!${mainCommand}`)
+        : text;
+
+    console.log(`[Timer Widget] Trigger detected: "${text}". Normalized as "${normalizedText}". Force paused: ${forceStartPaused}. Running permission checks...`);
 
     if (!checkPrivileges(data)) {
         return;
     }
 
-    const commandParts = text.split(' ');
+    const commandParts = normalizedText.split(' ');
     const actionOrTime = (commandParts[1] || '').toLowerCase();
 
     // Get the custom trigger word from settings, fallback to 'redeem' if missing
-    const textOnlyCommand = (fieldData && fieldData.textOnlyCommand ? fieldData.textOnlyCommand : 'redeem').toLowerCase().trim();
+    const textOnlyCommand = sanitizeConfiguredCommand(fieldData && fieldData.textOnlyCommand, 'redeem');
 
     switch(actionOrTime) {
         case 'pause':
@@ -527,11 +620,11 @@ const handleMessage = (obj) => {
             return;
     }
 
-    const parsedCommand = parseTimeCommand(text);
+    const parsedCommand = parseTimeCommand(normalizedText);
     if (parsedCommand !== null) {
         switch (parsedCommand.operation) {
             case 'set':
-                handleNewTimerCommand(parsedCommand.duration, parsedCommand.description);
+                handleNewTimerCommand(parsedCommand.duration, parsedCommand.description, forceStartPaused);
                 break;
             case 'add':
             case 'subtract':
@@ -728,6 +821,7 @@ function connectKickChat(chatroomId) {
 window.addEventListener('onWidgetLoad', async function (obj) {
     console.log("[Timer Widget] --- INITIALIZATION START ---");
     fieldData = obj.detail.fieldData;
+    normalizeCommandSettings(fieldData);
 
     // --- Initiate Native Kick Connection ---
     if (fieldData.kickChatroomId && fieldData.kickChatroomId.trim() !== '') {
