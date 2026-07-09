@@ -4,10 +4,16 @@
     "label": "Preview Mode (Always Visible)",
     "value": false
   },
-  "triggerCommands": {
+  "commandMain": {
     "type": "text",
-    "label": "Timer Trigger Commands (comma-separated)",
-    "value": "time, timer",
+    "label": "Main Trigger Command",
+    "value": "time",
+    "group": "Commands"
+  },
+  "commandPaused": {
+    "type": "text",
+    "label": "Paused Trigger Command",
+    "value": "timer",
     "group": "Commands"
   },
   "textOnlyCommand": {
