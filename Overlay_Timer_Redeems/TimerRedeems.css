@@ -1,0 +1,89 @@
+/* styles.css */
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@700&display=swap');
+
+* {
+    box-sizing: border-box; /* Making the border not break the layout */
+}
+
+body {
+    margin: 0;
+    height: 100vh;
+    width: 100vw;
+    background-color: transparent;
+    font-family: 'Roboto', sans-serif;
+    
+    /* Create a "safe zone" to prevent clipping at the edges of the widget bounds */
+    padding: 20px; 
+    
+    /* Center the container within the safe zone */
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.hidden {
+    display: none;
+}
+
+#timer-container {
+    border-radius: 35px;
+    padding: 20px 40px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    
+    /* Set a minimum width for aesthetics, but allow it to grow */
+    min-width: 300px;
+    max-width: 100%; /* The container will fill the parent's (body) padding box */
+    
+    opacity: 0;
+    visibility: hidden;
+    /* Background, shadow, and border are now applied via JavaScript */
+    word-wrap: break-word; /* Allow long words in description to break */
+}
+
+#timer-container.fade-effect {
+    transition: opacity 5s ease, visibility 5s ease;
+}
+
+#timer-container.visible {
+    visibility: visible;
+    opacity: 1;
+}
+
+#timer-display {
+    /* Font size, color, and text-shadow are now set via JavaScript from field settings */
+    font-weight: bold;
+    letter-spacing: 2px;
+    transition: color 0.3s ease, text-shadow 0.3s ease, opacity 0.3s ease;
+    white-space: nowrap;
+}
+
+#timer-display.paused {
+    opacity: 0.6; /* Visual indicator that the timer is paused */
+}
+
+
+#timer-description {
+    color: #f8f8f2;
+    margin-top: 15px;
+    text-shadow: 0 2px 8px rgba(0, 0, 0, 0.7);
+    text-align: center;
+    line-height: 1.2;
+    max-width: 100%;
+}
+
+.blink {
+    color: #E50B5B !important;
+    text-shadow: 
+        0 0 20px rgba(229, 11, 91, 0.7), 
+        0 0 30px rgba(229, 11, 91, 0.5), 
+        0 0 45px rgba(229, 11, 91, 0.4) !important;
+    animation: blink-animation 1s infinite;
+}
+
+@keyframes blink-animation {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}

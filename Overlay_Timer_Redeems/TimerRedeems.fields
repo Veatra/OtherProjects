@@ -1,0 +1,149 @@
+{
+  "preview": {
+    "type": "checkbox",
+    "label": "Preview Mode (Always Visible)",
+    "value": false
+  },
+  "triggerCommands": {
+    "type": "text",
+    "label": "Timer Trigger Commands (comma-separated)",
+    "value": "time, timer",
+    "group": "Commands"
+  },
+  "textOnlyCommand": {
+    "type": "text",
+    "label": "Text-Only Trigger Word",
+    "value": "redeem",
+    "group": "Commands"
+  },
+  "permissions": {
+    "type": "dropdown",
+    "label": "Who can use the timer:",
+    "value": "mods",
+    "options": {
+      "broadcaster": "Broadcaster Only",
+      "mods": "Mods & Broadcaster",
+      "whitelist": "Specific Users (Whitelist)"
+    },
+    "group": "Permissions"
+  },
+  "kickChatroomId": {
+    "type": "text",
+    "label": "Kick Chatroom ID (Required for Kick Chat)",
+    "value": "",
+    "group": "Cross-Platform"
+  },
+  "userWhitelist": {
+    "type": "text",
+    "label": "Whitelisted Users (Usernames or IDs, comma-separated)",
+    "value": "",
+    "group": "Permissions"
+  },
+  "timerFontSize": {
+    "type": "number",
+    "label": "Timer Font Size (rem)",
+    "value": 5,
+    "step": 0.1,
+    "group": "Appearance"
+  },
+  "timerFontColor": {
+    "type": "dropdown",
+    "label": "Timer Font Color",
+    "value": "#8be9fd",
+    "options": {
+      "#8be9fd": "Light Cyan (Default)",
+      "#f8f8f2": "Bright White",
+      "#50fa7b": "Neon Green",
+      "#ffb86c": "Bright Orange",
+      "#bd93f9": "Soft Purple",
+      "#4dffff": "Electric Blue",
+      "#ff79c6": "Pastel Pink",
+      "#ff5555": "Fiery Red",
+      "#f1fa8c": "Vibrant Yellow"
+    },
+    "group": "Appearance"
+  },
+  "descriptionFontSize": {
+    "type": "number",
+    "label": "Description Font Size (rem)",
+    "value": 2.5,
+    "step": 0.1,
+    "group": "Appearance"
+  },
+  "descriptionPosition": {
+    "type": "dropdown",
+    "label": "Description Position:",
+    "value": "bottom",
+    "options": {
+      "top": "Top",
+      "bottom": "Bottom"
+    },
+    "group": "Appearance"
+  },
+  "backgroundStyle": {
+    "type": "dropdown",
+    "label": "Background Style",
+    "value": "standard",
+    "options": {
+      "standard": "Standard (Default)",
+      "custom": "Custom Color",
+      "none": "None"
+    },
+    "group": "Background & Border"
+  },
+  "customBackgroundColor": {
+    "type": "colorpicker",
+    "label": "Background Color",
+    "value": "#44475a",
+    "group": "Background & Border"
+  },
+  "backgroundOpacity": {
+    "type": "slider",
+    "label": "Background Opacity (%)",
+    "value": 100,
+    "min": 0,
+    "max": 100,
+    "step": 1,
+    "group": "Background & Border"
+  },
+  "borderStyle": {
+    "type": "dropdown",
+    "label": "Border Style",
+    "value": "none",
+    "options": {
+      "none": "None (Default)",
+      "solid": "Solid"
+    },
+    "group": "Background & Border"
+  },
+  "borderColor": {
+    "type": "colorpicker",
+    "label": "Border Color",
+    "value": "#f8f8f2",
+    "group": "Background & Border"
+  },
+  "borderThickness": {
+    "type": "number",
+    "label": "Border Thickness (px)",
+    "value": 3,
+    "min": 1,
+    "step": 1,
+    "group": "Background & Border"
+  },
+  "offlineBehavior": {
+    "type": "dropdown",
+    "label": "When stream ends with timer running:",
+    "value": "pauseOnOffline",
+    "options": {
+      "runWhileOffline": "Let timer run in background",
+      "pauseOnOffline": "Automatically pause timer"
+    },
+    "group": "System Settings"
+  },
+  "useFadeAnimation": {
+    "type": "checkbox",
+    "label": "Enable Fade Animation (5s)",
+    "value": true,
+    "group": "System Settings"
+  }
+}
