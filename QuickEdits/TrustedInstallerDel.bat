@@ -26,6 +26,12 @@
 ::   attribute string orders and entirely avoids pipe (|) subshell crashes.
 :: - Block-Safe Console Logs: Replaced standard parentheses with square 
 ::   brackets in echo outputs to prevent '... was unexpected' parser crashes.
+:: - Same-Drive Progress Filtering: Successful per-item messages emitted by
+::   TAKEOWN are hidden only when they refer to the requested target's drive.
+::   Diagnostics, summary messages, and paths on other drives remain visible.
+:: - Target-Type Validation: A directory cannot accidentally be processed by
+::   the file branch [or vice versa], preserving the deletion scope selected
+::   by the user. All commands remain compatible with Windows 8.1.
 :: =====================================================================
 
 @echo off
@@ -36,11 +42,17 @@ setlocal enabledelayedexpansion
 :: ---------------------------------------------------------------------
 :CheckAdmin
 :: We suppress output here so cacls doesn't flood the screen or pause execution
-"%SYSTEMROOT%\system32\cacls.exe" "%SYSTEMROOT%\system32\config\system"
+"%SYSTEMROOT%\system32\cacls.exe" "%SYSTEMROOT%\system32\config\system" >nul 2>&1
 if '%errorlevel%' NEQ '0' (
     echo [INFO] Requesting administrative privileges...
-    :: Escaped double-quotes protect against paths containing apostrophes or ampersands
-    powershell -Command "Start-Process -FilePath \"%~f0\" -Verb RunAs"
+    :: Pass the path through the environment so PowerShell does not parse any
+    :: special characters from the script path as part of its command text.
+    set "elevate_script_path=%~f0"
+    powershell.exe -NoProfile -Command "Start-Process -FilePath $env:elevate_script_path -Verb RunAs"
+    if errorlevel 1 (
+        echo [ERROR] Administrative elevation was canceled or could not be started.
+        pause
+    )
     exit /b
 )
 
@@ -61,6 +73,7 @@ set "filepath="
 set "confirm="
 set "attribs="
 set "is_link=false"
+set "same_drive_success_pattern="
 
 set /p choice="Do you want to delete a (F)ile, a (D)irectory, or (Q)uit? (F/D/Q): "
 
@@ -134,6 +147,34 @@ if not exist "!filepath!" (
     goto MainMenu
 )
 
+:: Verify that the selected operation matches the resolved object. Without
+:: this check, DEL given a directory can remove files inside that directory
+:: even though the user selected the file-only operation.
+for %%i in ("!filepath!") do set "attribs=%%~ai"
+if /i "!attribs:~0,1!"=="d" (
+    if not "!target_type!"=="directory" (
+        echo.
+        echo [ERROR] The specified path is a directory. Select D to delete it.
+        pause
+        goto MainMenu
+    )
+) else (
+    if not "!target_type!"=="file" (
+        echo.
+        echo [ERROR] The specified path is a file. Select F to delete it.
+        pause
+        goto MainMenu
+    )
+)
+
+:: TAKEOWN reports every successfully processed item. Filter only successful
+:: item messages for the local drive containing the requested target. Anchoring
+:: on SUCCESS preserves errors and system/summary output even when those lines
+:: contain the same path. UNC paths have no drive letter and are left unfiltered.
+if "!filepath:~1,2!"==":\" (
+    set "same_drive_success_pattern=^SUCCESS:.*!filepath:~0,1!:\\"
+)
+
 :: ---------------------------------------------------------------------
 :: 4. Safety Confirmation Prompt
 :: ---------------------------------------------------------------------
@@ -158,8 +199,7 @@ echo [INFO] Starting deletion process for !target_type!...
 :: 5. Execution & Link-Safe Operations
 :: ---------------------------------------------------------------------
 
-:: Extract attributes natively
-for %%i in ("!filepath!") do set "attribs=%%~ai"
+:: Attributes were extracted during target-type validation above.
 
 :: Robustly check for Reparse Point 'l' (link/junction) in the attribute string.
 :: We use string substitution (!attribs:l=!) to detect 'l' without using pipes (|), 
@@ -176,7 +216,11 @@ if "!target_type!"=="file" (
         echo [INFO] File Symbolic Link detected. Skipping 'takeown' to protect target files.
     ) else (
         echo [INFO] Taking ownership of the file...
-        takeown /f "!filepath!" 
+        if defined same_drive_success_pattern (
+            takeown /f "!filepath!" | "%SYSTEMROOT%\system32\findstr.exe" /v /i /r /c:"!same_drive_success_pattern!"
+        ) else (
+            takeown /f "!filepath!"
+        )
     )
 
     echo [INFO] Modifying file permissions...
@@ -199,7 +243,11 @@ if "!target_type!"=="file" (
     ) else (
         :: Fix: Removed inner parentheses around "Safely skipping..." to prevent batch parser block-break bugs
         echo [INFO] Taking ownership of directory contents [Safely skipping external links]...
-        takeown /f "!filepath!" /r /d y /skipsl 
+        if defined same_drive_success_pattern (
+            takeown /f "!filepath!" /r /d y /skipsl | "%SYSTEMROOT%\system32\findstr.exe" /v /i /r /c:"!same_drive_success_pattern!"
+        ) else (
+            takeown /f "!filepath!" /r /d y /skipsl
+        )
         
         echo [INFO] Modifying directory permissions...
         icacls "!filepath!" /grant administrators:F /t /l /c /q 
