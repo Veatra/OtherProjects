@@ -6,8 +6,8 @@
 :: permissions and removing 'TrustedInstaller' protections.
 :: 
 :: Upgraded Safety Mechanisms:
-:: - Path Canonicalization (%%~fi): Resolves relative paths (.. or .), 
-::   strips trailing spaces, and standardizes formats before execution.
+:: - Lexical Path Normalization (%%~fi): Resolves relative path syntax such
+::   as `..` and `.` without claiming to dereference junctions or symlinks.
 :: - Universal Root Protection: Detects if the canonicalized path lacks a 
 ::   name/extension component (%%~nxi), which mathematically blocks both 
 ::   local drive roots (C:\) and UNC share roots (\\server\share\).
@@ -32,6 +32,12 @@
 :: - Target-Type Validation: A directory cannot accidentally be processed by
 ::   the file branch [or vice versa], preserving the deletion scope selected
 ::   by the user. All commands remain compatible with Windows 8.1.
+:: - Reparse-Ancestor Protection: Rejects targets located underneath a link or
+::   junction. Directly selected links can still be safely unlinked, but a link
+::   hidden in an ancestor cannot redirect deletion into an unexpected tree.
+:: - Pipe-Safe TAKEOWN Calls: Pipelines live in dedicated subroutines and use
+::   percent-expanded values, so CMD pipe subprocesses do not depend on delayed
+::   expansion being enabled in their independently parsed command lines.
 :: =====================================================================
 
 @echo off
@@ -74,6 +80,7 @@ set "confirm="
 set "attribs="
 set "is_link=false"
 set "same_drive_success_pattern="
+set "reparse_ancestor_path="
 
 set /p choice="Do you want to delete a (F)ile, a (D)irectory, or (Q)uit? (F/D/Q): "
 
@@ -115,6 +122,8 @@ if "!filepath:~-1!"==":" (
 :: 3. Path Canonicalization & Critical Trailing Slash Mitigation
 :: ---------------------------------------------------------------------
 :: Convert to absolute canonical path. This resolves ".." or "." securely.
+:: FOR's %%~fi modifier computes a fully qualified lexical path; it does not
+:: resolve the destination of a junction or symbolic link.
 for %%i in ("!filepath!") do set "filepath=%%~fi"
 
 :: STRIP TRAILING SLASH: 
@@ -167,6 +176,21 @@ if /i "!attribs:~0,1!"=="d" (
     )
 )
 
+:: A final item may look like a normal file even when one of its parent path
+:: components is a junction to another drive or directory. Reject that case
+:: before confirmation and before any permission changes. The target itself is
+:: deliberately excluded so a directly selected link can still be unlinked by
+:: the existing link-safe branch.
+call :FindReparseAncestor
+if defined reparse_ancestor_path (
+    echo.
+    echo [ERROR] SAFEGUARD TRIGGERED: The target is inside a link or junction.
+    echo [ERROR] Reparse-point ancestor: "!reparse_ancestor_path!"
+    echo [INFO] Select the link itself, or enter the destination path explicitly.
+    pause
+    goto MainMenu
+)
+
 :: TAKEOWN reports every successfully processed item. Filter only successful
 :: item messages for the local drive containing the requested target. Anchoring
 :: on SUCCESS preserves errors and system/summary output even when those lines
@@ -217,7 +241,7 @@ if "!target_type!"=="file" (
     ) else (
         echo [INFO] Taking ownership of the file...
         if defined same_drive_success_pattern (
-            takeown /f "!filepath!" | "%SYSTEMROOT%\system32\findstr.exe" /v /i /r /c:"!same_drive_success_pattern!"
+            call :TakeOwnershipOfFileFiltered
         ) else (
             takeown /f "!filepath!"
         )
@@ -244,7 +268,7 @@ if "!target_type!"=="file" (
         :: Fix: Removed inner parentheses around "Safely skipping..." to prevent batch parser block-break bugs
         echo [INFO] Taking ownership of directory contents [Safely skipping external links]...
         if defined same_drive_success_pattern (
-            takeown /f "!filepath!" /r /d y /skipsl | "%SYSTEMROOT%\system32\findstr.exe" /v /i /r /c:"!same_drive_success_pattern!"
+            call :TakeOwnershipOfDirectoryFiltered
         ) else (
             takeown /f "!filepath!" /r /d y /skipsl
         )
@@ -271,3 +295,45 @@ echo.
 echo [INFO] Operation complete. Press any key to return to the main menu.
 pause >nul
 goto MainMenu
+
+:: ---------------------------------------------------------------------
+:: 7. Safety & Output-Filtering Subroutines
+:: ---------------------------------------------------------------------
+
+:FindReparseAncestor
+:: Input:  filepath is the already normalized target path.
+:: Output: reparse_ancestor_path is empty when no parent is a reparse point;
+::         otherwise it contains the nearest reparse-point ancestor.
+:: Rationale: lexical normalization intentionally preserves link components.
+:: Walking upward prevents an ancestor junction from silently redirecting the
+:: later ownership, ACL, or deletion commands to a different physical tree.
+set "reparse_ancestor_path="
+for %%i in ("%filepath%") do set "ancestor_path=%%~dpi"
+
+:InspectNextAncestor
+:: Keep drive and UNC roots intact while removing separators from other paths.
+if "!ancestor_path:~-1!"=="\" if not "!ancestor_path:~-2!"==":\" set "ancestor_path=!ancestor_path:~0,-1!"
+for %%i in ("!ancestor_path!") do set "ancestor_attributes=%%~ai"
+if defined ancestor_attributes if not "!ancestor_attributes!"=="!ancestor_attributes:l=!" (
+    set "reparse_ancestor_path=!ancestor_path!"
+    exit /b 0
+)
+
+for %%i in ("!ancestor_path!") do set "parent_ancestor_path=%%~dpi"
+if "!parent_ancestor_path:~-1!"=="\" if not "!parent_ancestor_path:~-2!"==":\" set "parent_ancestor_path=!parent_ancestor_path:~0,-1!"
+if /i "!parent_ancestor_path!"=="!ancestor_path!" exit /b 0
+set "ancestor_path=!parent_ancestor_path!"
+goto InspectNextAncestor
+
+:TakeOwnershipOfFileFiltered
+:: Percent expansion occurs before CMD divides this pipeline into subprocesses.
+:: Consequently the child commands receive concrete values even though they do
+:: not inherit this script's delayed-expansion mode.
+takeown /f "%filepath%" | "%SYSTEMROOT%\system32\findstr.exe" /v /i /r /c:"%same_drive_success_pattern%"
+exit /b
+
+:TakeOwnershipOfDirectoryFiltered
+:: /SKIPSL retains the established Windows 8.1-compatible behavior of avoiding
+:: traversal into links encountered during recursive directory ownership.
+takeown /f "%filepath%" /r /d y /skipsl | "%SYSTEMROOT%\system32\findstr.exe" /v /i /r /c:"%same_drive_success_pattern%"
+exit /b
