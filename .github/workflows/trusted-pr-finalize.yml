@@ -1,0 +1,199 @@
+# Trusted PR approval and merge finalizer
+#
+# This workflow is intentionally separate from trusted-pr-automerge.yml. GitHub
+# reported the PR as `unstable` while the trust-gate check itself was running and
+# rejected enablePullRequestAutoMerge. `workflow_run` starts only after that gate
+# succeeds, eliminating the circular check/auto-merge timing problem.
+#
+# Security invariants:
+# - No PR code is checked out, interpreted, imported, or executed.
+# - The successful upstream run, same-repository origin, allowlist, trusted
+#   association, and exact immutable head SHA are all independently revalidated.
+# - A clean PR is squash-merged with an expected SHA. A PR blocked by genuine
+#   repository requirements has native auto-merge enabled instead.
+name: Finalize trusted PR
+
+on:
+  workflow_run:
+    workflows: [Trusted PR auto-merge]
+    types: [completed]
+
+concurrency:
+  group: trusted-pr-finalize-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+
+jobs:
+  approve-and-merge:
+    name: Approve and merge trusted PR
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TRUSTED_PR_AUTHORS: ${{ vars.TRUSTED_PR_AUTHORS }}
+      TRUSTED_MERGE_MODE: ${{ vars.TRUSTED_MERGE_MODE || 'AUTO' }}
+      EXPECTED_REPOSITORY: ${{ github.repository }}
+
+    steps:
+      - name: Revalidate, approve, and finalize the trusted PR
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const workflowRun = context.payload.workflow_run;
+            const mergeMode = (process.env.TRUSTED_MERGE_MODE || "AUTO").trim().toUpperCase();
+            const pullRequestReference = workflowRun.pull_requests?.[0];
+            const trustedAuthors = new Set(
+              (process.env.TRUSTED_PR_AUTHORS || "")
+                .split(/[\s,]+/)
+                .map((login) => login.trim().toLowerCase())
+                .filter(Boolean),
+            );
+            const trustedAssociations = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+
+            if (mergeMode !== "AUTO") {
+              core.info(`[finalizer] Merge mode is ${mergeMode}; DIRECT mode already finalizes in the trust-gate workflow.`);
+              return;
+            }
+            if (!pullRequestReference) {
+              core.setFailed("[finalizer] Successful workflow run has no associated pull request; refusing to infer one.");
+              return;
+            }
+
+            const { data: pullRequest } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pullRequestReference.number,
+            });
+            const authorLogin = pullRequest.user.login;
+            const sourceRepository = pullRequest.head.repo?.full_name;
+            core.info(`[finalizer] pr=${pullRequest.number} author=${authorLogin} association=${pullRequest.author_association} sha=${pullRequest.head.sha}`);
+
+            if (pullRequest.state !== "open" || pullRequest.draft) {
+              core.setFailed("[finalizer] PR is closed or draft; refusing approval and merge.");
+              return;
+            }
+            if (!sourceRepository || sourceRepository.toLowerCase() !== process.env.EXPECTED_REPOSITORY.toLowerCase()) {
+              core.setFailed("[finalizer] Forks and unknown source repositories are forbidden.");
+              return;
+            }
+            if (!trustedAuthors.has(authorLogin.toLowerCase()) || !trustedAssociations.has(pullRequest.author_association)) {
+              core.setFailed(`[finalizer] ${authorLogin} no longer satisfies the explicit allowlist and association checks.`);
+              return;
+            }
+            if (pullRequest.head.sha !== workflowRun.head_sha || pullRequestReference.head.sha !== workflowRun.head_sha) {
+              // Conflict resolution intentionally pushes a new head and starts a
+              // replacement trust run. Treat that known handoff as a successful
+              // no-op, but retain a real failure when no successor is visible:
+              // silently accepting an unexplained head change would hide a lost
+              // validation event and make operational failures harder to notice.
+              let successorTrustRun;
+              for (let attempt = 1; attempt <= 3 && !successorTrustRun; attempt += 1) {
+                const { data: workflowRuns } = await github.rest.actions.listWorkflowRuns({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id: workflowRun.workflow_id,
+                  branch: pullRequest.head.ref,
+                  event: "pull_request_target",
+                  per_page: 100,
+                });
+                successorTrustRun = workflowRuns.workflow_runs.find(
+                  (candidateRun) =>
+                    candidateRun.id > workflowRun.id &&
+                    candidateRun.head_sha === pullRequest.head.sha &&
+                    ["queued", "in_progress", "completed"].includes(candidateRun.status),
+                );
+                if (!successorTrustRun && attempt < 3) {
+                  core.info(`[superseded] Replacement trust run for ${pullRequest.head.sha} is not visible yet; retrying (${attempt}/3).`);
+                  await new Promise((resolve) => setTimeout(resolve, 2000));
+                }
+              }
+
+              if (successorTrustRun) {
+                core.notice(
+                  `[superseded] No approval or merge was attempted for stale SHA ${workflowRun.head_sha}. ` +
+                  `Replacement trust run ${successorTrustRun.id} is validating current SHA ${pullRequest.head.sha}: ${successorTrustRun.html_url}`,
+                );
+                return;
+              }
+
+              core.setFailed(
+                `[finalizer] PR head changed from validated SHA ${workflowRun.head_sha} to ${pullRequest.head.sha}, ` +
+                "but no replacement trust run was found. Refusing approval and merge; trigger a new PR synchronize event.",
+              );
+              return;
+            }
+
+            const { data: existingReviews } = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pullRequest.number,
+            });
+            const alreadyApprovedByActions = existingReviews.some(
+              (review) => review.user?.login === "github-actions[bot]" && review.state === "APPROVED",
+            );
+            if (!alreadyApprovedByActions) {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pullRequest.number,
+                commit_id: pullRequest.head.sha,
+                event: "APPROVE",
+                body: "Automated policy approval: same-repository PR, explicitly allowlisted author, trusted association, and immutable SHA validated.",
+              });
+              core.info(`[approval] Approved trusted PR #${pullRequest.number} at ${pullRequest.head.sha}.`);
+            } else {
+              core.info("[approval] Current GitHub Actions approval already exists; avoiding a duplicate review.");
+            }
+
+            // Approval can change mergeable_state, so request fresh metadata and
+            // briefly wait for GitHub to recompute the integration state.
+            let currentPullRequest;
+            for (let attempt = 1; attempt <= 6; attempt += 1) {
+              ({ data: currentPullRequest } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pullRequest.number,
+              }));
+              core.info(`[finalizer] attempt=${attempt} mergeable=${currentPullRequest.mergeable} state=${currentPullRequest.mergeable_state}`);
+              if (currentPullRequest.head.sha !== pullRequest.head.sha) {
+                core.setFailed("[finalizer] Head changed while GitHub recomputed mergeability; refusing to continue.");
+                return;
+              }
+              if (currentPullRequest.mergeable !== null && currentPullRequest.mergeable_state !== "unknown") break;
+              await new Promise((resolve) => setTimeout(resolve, 5000));
+            }
+
+            if (currentPullRequest.mergeable_state === "clean" || currentPullRequest.mergeable_state === "has_hooks") {
+              const { data: mergeResult } = await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pullRequest.number,
+                merge_method: "squash",
+                sha: pullRequest.head.sha,
+              });
+              if (!mergeResult.merged) {
+                core.setFailed(`[merge] GitHub refused the clean PR merge: ${mergeResult.message || "unknown reason"}.`);
+                return;
+              }
+              core.info(`[merge] Squash-merged trusted PR #${pullRequest.number}.`);
+              return;
+            }
+
+            core.info(`[automerge] PR is ${currentPullRequest.mergeable_state}; enabling native auto-merge to wait for repository requirements.`);
+            await github.graphql(`
+              mutation EnableTrustedPullRequestAutoMerge($pullRequestId: ID!, $expectedHeadOid: GitObjectID!) {
+                enablePullRequestAutoMerge(input: {
+                  pullRequestId: $pullRequestId
+                  mergeMethod: SQUASH
+                  expectedHeadOid: $expectedHeadOid
+                }) { pullRequest { number autoMergeRequest { enabledAt mergeMethod } } }
+              }
+            `, {
+              pullRequestId: pullRequest.node_id,
+              expectedHeadOid: pullRequest.head.sha,
+            });
+            core.info("[automerge] Native auto-merge enabled; GitHub will finish after remaining requirements pass.");
