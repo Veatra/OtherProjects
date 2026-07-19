@@ -25,6 +25,8 @@
 ::   Diagnostics, summary messages, and paths on other drives remain visible.
 ::   The FINDSTR expression ends at the drive colon [for example, `K:`]; a
 ::   trailing backslash next to /C's closing quote is not Windows 8.1-safe.
+::   Empty records accompanying filtered TAKEOWN items are also suppressed so
+::   recursive operations do not fill the console with blank progress lines.
 :: - Target-Type Validation: A directory cannot accidentally be processed by
 ::   the file branch [or vice versa], preserving the deletion scope selected
 ::   by the user. All commands remain compatible with Windows 8.1.
@@ -342,13 +344,13 @@ goto InspectNextAncestor
 :: Percent expansion occurs before CMD divides this pipeline into subprocesses.
 :: Consequently the child commands receive concrete values even though they do
 :: not inherit this script's delayed-expansion mode.
-takeown /f "%filepath%" | "%SYSTEMROOT%\system32\findstr.exe" /v /i /r /c:"%same_drive_success_pattern%"
+takeown /f "%filepath%" | "%SYSTEMROOT%\system32\findstr.exe" /v /i /r /c:"%same_drive_success_pattern%" /c:"^$"
 if errorlevel 2 echo [WARNING] TAKEOWN ran, but its progress output could not be filtered.
 exit /b
 
 :TakeOwnershipOfDirectoryFiltered
 :: /SKIPSL retains the established Windows 8.1-compatible behavior of avoiding
 :: traversal into links encountered during recursive directory ownership.
-takeown /f "%filepath%" /r /d y /skipsl | "%SYSTEMROOT%\system32\findstr.exe" /v /i /r /c:"%same_drive_success_pattern%"
+takeown /f "%filepath%" /r /d y /skipsl | "%SYSTEMROOT%\system32\findstr.exe" /v /i /r /c:"%same_drive_success_pattern%" /c:"^$"
 if errorlevel 2 echo [WARNING] TAKEOWN ran, but its progress output could not be filtered.
 exit /b
