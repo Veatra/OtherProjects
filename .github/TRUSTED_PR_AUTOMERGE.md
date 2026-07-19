@@ -120,10 +120,11 @@ The workflow enables auto-merge for the new resolution SHA immediately after pus
 
 ## Operational and security notes
 
-- Pin third-party actions to full commit SHAs for stronger supply-chain control. `actions/github-script@v7` is readable and receives only trusted metadata, but a SHA pin is stricter than a major tag.
+- Pin third-party actions to full commit SHAs for stronger supply-chain control. `actions/github-script@v9` is readable and receives only trusted metadata, but a SHA pin is stricter than a major tag.
 - Keep the workflow on a protected default branch and require CODEOWNERS review for `.github/workflows/**` changes.
 - Do not add `actions/checkout` of the PR, `npm install`, tests, composite actions from the PR, or any command that interprets PR files to this `pull_request_target` job. Run ordinary tests in a separate `pull_request` workflow with read-only permissions.
 - `AUTO` mode uses `trusted-pr-finalize.yml` only after the trust-gate workflow succeeds. This avoids GitHub's `Pull request is in unstable status` error caused by trying to enable auto-merge while the gate's own check was still running.
+- After conflict resolution, the obsolete finalizer for the pre-resolution SHA exits with a `[superseded]` notice only when it verifies that a newer trust run is validating the new SHA. An unexplained head change with no successor still fails loudly and never approves or merges.
 - Environment secrets are deliberately unnecessary. If switching to a GitHub App token, protect its environment with reviewers and restrict the App to this repository with only Contents and Pull requests write permissions.
 - Auto-merge may complete immediately if no branch rule requires checks. Configure required checks before enabling this workflow.
 - In `DIRECT` mode, check names are security configuration. Review changes to `TRUSTED_REQUIRED_CHECKS` as carefully as workflow changes, and never remove every meaningful test merely to make a PR merge.

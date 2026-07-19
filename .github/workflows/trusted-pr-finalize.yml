@@ -23,6 +23,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: write
   pull-requests: write
 
@@ -84,7 +85,45 @@ jobs:
               return;
             }
             if (pullRequest.head.sha !== workflowRun.head_sha || pullRequestReference.head.sha !== workflowRun.head_sha) {
-              core.setFailed(`[finalizer] PR head changed after the successful trust run (${workflowRun.head_sha}); a new run must validate it.`);
+              // Conflict resolution intentionally pushes a new head and starts a
+              // replacement trust run. Treat that known handoff as a successful
+              // no-op, but retain a real failure when no successor is visible:
+              // silently accepting an unexplained head change would hide a lost
+              // validation event and make operational failures harder to notice.
+              let successorTrustRun;
+              for (let attempt = 1; attempt <= 3 && !successorTrustRun; attempt += 1) {
+                const { data: workflowRuns } = await github.rest.actions.listWorkflowRuns({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id: workflowRun.workflow_id,
+                  branch: pullRequest.head.ref,
+                  event: "pull_request_target",
+                  per_page: 100,
+                });
+                successorTrustRun = workflowRuns.workflow_runs.find(
+                  (candidateRun) =>
+                    candidateRun.id > workflowRun.id &&
+                    candidateRun.head_sha === pullRequest.head.sha &&
+                    ["queued", "in_progress", "completed"].includes(candidateRun.status),
+                );
+                if (!successorTrustRun && attempt < 3) {
+                  core.info(`[superseded] Replacement trust run for ${pullRequest.head.sha} is not visible yet; retrying (${attempt}/3).`);
+                  await new Promise((resolve) => setTimeout(resolve, 2000));
+                }
+              }
+
+              if (successorTrustRun) {
+                core.notice(
+                  `[superseded] No approval or merge was attempted for stale SHA ${workflowRun.head_sha}. ` +
+                  `Replacement trust run ${successorTrustRun.id} is validating current SHA ${pullRequest.head.sha}: ${successorTrustRun.html_url}`,
+                );
+                return;
+              }
+
+              core.setFailed(
+                `[finalizer] PR head changed from validated SHA ${workflowRun.head_sha} to ${pullRequest.head.sha}, ` +
+                "but no replacement trust run was found. Refusing approval and merge; trigger a new PR synchronize event.",
+              );
               return;
             }
 
