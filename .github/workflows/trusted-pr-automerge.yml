@@ -56,7 +56,7 @@ jobs:
     steps:
       - name: Validate immutable PR trust metadata
         id: trust
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           EXPECTED_REPOSITORY: ${{ github.repository }}
         with:
@@ -122,7 +122,7 @@ jobs:
 
       - name: Inspect mergeability
         id: mergeability
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             // GitHub may briefly report null while computing mergeability.
@@ -190,7 +190,7 @@ jobs:
 
       - name: Wait for explicitly required checks in direct-merge mode
         if: steps.trust.outputs.merge_mode == 'DIRECT'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           MERGE_HEAD_SHA: ${{ steps.mergeability.outputs.has_conflicts == 'true' && steps.conflict-resolution.outputs.resolved_head_sha || github.event.pull_request.head.sha }}
         with:
@@ -244,40 +244,16 @@ jobs:
             }
             core.setFailed(`[checks] Required checks did not all succeed on ${mergeHeadSha} within five minutes; rerun after they complete.`);
 
-      - name: Enable GitHub-native auto-merge
+      - name: Defer AUTO finalization until this trust check completes
         if: steps.trust.outputs.merge_mode == 'AUTO'
-        # Enable immediately for either the original clean SHA or the newly
-        # resolved SHA. GitHub still enforces every branch protection rule.
-        uses: actions/github-script@v7
-        env:
-          AUTO_MERGE_HEAD_SHA: ${{ steps.mergeability.outputs.has_conflicts == 'true' && steps.conflict-resolution.outputs.resolved_head_sha || github.event.pull_request.head.sha }}
-        with:
-          script: |
-            const pullRequestNodeId = context.payload.pull_request.node_id;
-            const expectedHeadOid = process.env.AUTO_MERGE_HEAD_SHA;
-            core.info(`[automerge] Enabling SQUASH auto-merge for PR #${process.env.PR_NUMBER} at ${expectedHeadOid}.`);
-            await github.graphql(`
-              mutation EnableTrustedPullRequestAutoMerge(
-                $pullRequestId: ID!
-                $expectedHeadOid: GitObjectID!
-              ) {
-                enablePullRequestAutoMerge(input: {
-                  pullRequestId: $pullRequestId
-                  mergeMethod: SQUASH
-                  expectedHeadOid: $expectedHeadOid
-                }) {
-                  pullRequest { number autoMergeRequest { enabledAt mergeMethod } }
-                }
-              }
-            `, {
-              pullRequestId: pullRequestNodeId,
-              expectedHeadOid,
-            });
-            core.info("[automerge] Auto-merge enabled; GitHub will wait for branch protection requirements.");
+        # Enabling auto-merge from inside the check that makes the PR unstable
+        # can be rejected by GitHub. The workflow_run finalizer starts only after
+        # this entire guarded job succeeds, then approves and finalizes the PR.
+        run: echo "[automerge] Trust gate passed; finalization will start after this workflow completes successfully."
 
       - name: Squash merge after named checks (GitHub Free private repositories)
         if: steps.trust.outputs.merge_mode == 'DIRECT'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           DIRECT_MERGE_HEAD_SHA: ${{ steps.mergeability.outputs.has_conflicts == 'true' && steps.conflict-resolution.outputs.resolved_head_sha || github.event.pull_request.head.sha }}
         with:
