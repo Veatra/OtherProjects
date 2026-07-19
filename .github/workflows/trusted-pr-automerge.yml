@@ -1,0 +1,200 @@
+# Trusted pull-request auto-merge
+#
+# Security model:
+# - `pull_request_target` intentionally runs this workflow from the trusted base
+#   branch, never from the pull request. Do not add a checkout of the PR or run
+#   repository scripts in this job.
+# - A PR must be from this repository, have an explicitly allowlisted author,
+#   and have a trusted GitHub author association. These checks are cumulative.
+# - The workflow only performs Git operations after all trust checks succeed.
+#
+# Conflict policy:
+# The base branch is checked out first and the PR commit is merged with
+# `-X theirs`. In this orientation, "theirs" is the PR, so conflicting hunks
+# prefer the PR while non-conflicting changes from both sides are preserved.
+# This is safer than replacing the base tree wholesale. Delete the conflict
+# step if maintainers should resolve every conflict manually instead.
+name: Trusted PR auto-merge
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+# One run per PR prevents two conflict-resolution pushes racing each other.
+concurrency:
+  group: trusted-pr-automerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate-and-automerge:
+    name: Validate trust and prepare auto-merge
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Repository variable, comma/newline/space separated; comparisons are
+      # case-insensitive. Example: "octocat, dependabot[bot], codex-service".
+      TRUSTED_PR_AUTHORS: ${{ vars.TRUSTED_PR_AUTHORS }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+      BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+
+    steps:
+      - name: Validate immutable PR trust metadata
+        id: trust
+        uses: actions/github-script@v7
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+        with:
+          script: |
+            const pullRequest = context.payload.pull_request;
+            const authorLogin = pullRequest.user.login;
+            const association = pullRequest.author_association;
+            const sourceRepository = pullRequest.head.repo?.full_name;
+            const trustedAssociations = new Set([
+              "OWNER",
+              "MEMBER",
+              "COLLABORATOR",
+            ]);
+            const trustedAuthors = new Set(
+              (process.env.TRUSTED_PR_AUTHORS || "")
+                .split(/[\s,]+/)
+                .map((login) => login.trim().toLowerCase())
+                .filter(Boolean),
+            );
+
+            core.info(`[trust] author=${authorLogin} association=${association} source=${sourceRepository}`);
+
+            if (!sourceRepository || sourceRepository.toLowerCase() !== process.env.EXPECTED_REPOSITORY.toLowerCase()) {
+              core.setFailed("[trust] Refusing PR: forks and deleted/unknown source repositories are not allowed.");
+              return;
+            }
+            if (trustedAuthors.size === 0) {
+              core.setFailed("[trust] TRUSTED_PR_AUTHORS is empty. Configure the repository variable before enabling auto-merge.");
+              return;
+            }
+            if (!trustedAuthors.has(authorLogin.toLowerCase())) {
+              core.setFailed(`[trust] Refusing PR: ${authorLogin} is not explicitly allowlisted.`);
+              return;
+            }
+            if (!trustedAssociations.has(association)) {
+              core.setFailed(`[trust] Refusing PR: author association ${association} is not OWNER, MEMBER, or COLLABORATOR.`);
+              return;
+            }
+
+            // Re-read the PR immediately before granting trust. This narrows the
+            // opportunity for stale event metadata to authorize a changed head.
+            const { data: currentPullRequest } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pullRequest.number,
+            });
+            if (currentPullRequest.head.sha !== pullRequest.head.sha ||
+                currentPullRequest.head.repo?.full_name?.toLowerCase() !== process.env.EXPECTED_REPOSITORY.toLowerCase()) {
+              core.setFailed("[trust] PR head changed during validation; a fresh synchronize event must validate it.");
+              return;
+            }
+            core.info(`[trust] Accepted ${authorLogin} at immutable head ${pullRequest.head.sha}.`);
+
+      - name: Inspect mergeability
+        id: mergeability
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // GitHub may briefly report null while computing mergeability.
+            for (let attempt = 1; attempt <= 6; attempt += 1) {
+              const { data: pullRequest } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: Number(process.env.PR_NUMBER),
+              });
+              core.info(`[mergeability] attempt=${attempt} mergeable=${pullRequest.mergeable} state=${pullRequest.mergeable_state}`);
+              if (pullRequest.head.sha !== process.env.PR_HEAD_SHA) {
+                core.setFailed("[mergeability] PR head changed after trust validation; stopping safely.");
+                return;
+              }
+              if (pullRequest.mergeable !== null) {
+                core.setOutput("has_conflicts", String(pullRequest.mergeable === false));
+                return;
+              }
+              await new Promise((resolve) => setTimeout(resolve, 5000));
+            }
+            core.setFailed("[mergeability] GitHub did not compute mergeability within 30 seconds; retry the workflow.");
+
+      - name: Resolve conflicts by preferring PR hunks
+        id: conflict-resolution
+        if: steps.mergeability.outputs.has_conflicts == 'true'
+        env:
+          # A GitHub App installation token or fine-grained PAT is strongly
+          # recommended: pushes made with GITHUB_TOKEN do not start new workflow
+          # runs, so required checks would not be produced for the resolved SHA.
+          GH_TOKEN: ${{ secrets.TRUSTED_PR_PUSH_TOKEN || github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+          echo "[conflict] Initializing a clean Git repository; no PR files or scripts will be executed."
+          git init --quiet conflict-resolution
+          cd conflict-resolution
+          git config core.hooksPath /dev/null
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git"
+
+          # Fetch immutable SHAs/refs with no tags, submodules, LFS, or checkout.
+          # Full history is intentional: a fixed shallow depth can hide the
+          # merge base and make two valid branches appear unrelated.
+          git fetch --quiet --no-tags origin \
+            "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/base" \
+            "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr"
+          fetched_pr_sha="$(git rev-parse refs/remotes/origin/pr)"
+          if [[ "${fetched_pr_sha}" != "${PR_HEAD_SHA}" ]]; then
+            echo "::error::[conflict] Fetched PR SHA changed from validated SHA; refusing to continue."
+            exit 1
+          fi
+
+          git switch --quiet --create conflict-resolution refs/remotes/origin/base
+          echo "[conflict] Merging ${PR_HEAD_SHA} into current ${BASE_BRANCH}; conflicting hunks prefer the PR."
+          git merge --no-edit --no-ff --strategy=ort --strategy-option=theirs refs/remotes/origin/pr
+
+          # --force-with-lease prevents overwriting a contributor push that raced
+          # this job. Branch protection must permit GitHub Actions to push.
+          git push origin \
+            "HEAD:refs/heads/${PR_HEAD_BRANCH}" \
+            "--force-with-lease=refs/heads/${PR_HEAD_BRANCH}:${PR_HEAD_SHA}"
+          echo "resolved_head_sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+          echo "[conflict] Pushed conflict-resolution merge commit. Required checks must run on the new head before merge."
+
+      - name: Enable auto-merge
+        # Enable immediately for either the original clean SHA or the newly
+        # resolved SHA. GitHub still enforces every branch protection rule.
+        uses: actions/github-script@v7
+        env:
+          AUTO_MERGE_HEAD_SHA: ${{ steps.mergeability.outputs.has_conflicts == 'true' && steps.conflict-resolution.outputs.resolved_head_sha || github.event.pull_request.head.sha }}
+        with:
+          script: |
+            const pullRequestNodeId = context.payload.pull_request.node_id;
+            const expectedHeadOid = process.env.AUTO_MERGE_HEAD_SHA;
+            core.info(`[automerge] Enabling SQUASH auto-merge for PR #${process.env.PR_NUMBER} at ${expectedHeadOid}.`);
+            await github.graphql(`
+              mutation EnableTrustedPullRequestAutoMerge(
+                $pullRequestId: ID!
+                $expectedHeadOid: GitObjectID!
+              ) {
+                enablePullRequestAutoMerge(input: {
+                  pullRequestId: $pullRequestId
+                  mergeMethod: SQUASH
+                  expectedHeadOid: $expectedHeadOid
+                }) {
+                  pullRequest { number autoMergeRequest { enabledAt mergeMethod } }
+                }
+              }
+            `, {
+              pullRequestId: pullRequestNodeId,
+              expectedHeadOid,
+            });
+            core.info("[automerge] Auto-merge enabled; GitHub will wait for branch protection requirements.");
